@@ -1,0 +1,17 @@
+# Never commit TAK certificates or keys
+*.p12
+*.pem
+*.key
+*.crt
+*.zip
+
+# Settings and state saved on the Hub
+payloads/**/default.cfg
+payloads/**/*.cfg
+web-password.txt
+state.json
+
+# Local test artifacts
+*.log
+*.pcap
+.DS_Store

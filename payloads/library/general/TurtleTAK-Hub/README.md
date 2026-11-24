@@ -55,11 +55,14 @@ A baseline is keyed by subnet, gateway IP and gateway MAC, and saved in `/root/t
 
 The Hub has no GPS. In `auto` mode TurtleTAK uses the first of these that works:
 
-1. **USB GPS** on the dynamic USB port (the one nearest the USB-C cable). A u-blox / VK-162 style NMEA receiver works. TurtleTAK claims the port for the Hub (`GPS_CLAIM_USB`).
-2. **Anchor to my ATAK**: your phone's position from the TAK Server or the mesh (`MY_ATAK`), if it's newer than 30 minutes.
-3. A **saved site** (`SITE`). Set one in Setup or by clicking the web map.
-4. A **manual** lat/lon.
-5. **Public IP** location, city level only. The marker gets a 25 km CE so TAK shows it's rough.
+1. **Radio GPS**: the Meshtastic radio's own GPS fix, shared by [TurtleMesh](https://github.com/SECT0101/TurtleMesh) while it runs on the same Hub (or both run in TurtleShell), if it's newer than `RADIO_GPS_MAX_AGE` (30 minutes).
+2. **USB GPS** on the dynamic USB port (the one nearest the USB-C cable). A u-blox / VK-162 style NMEA receiver works. TurtleTAK claims the port for the Hub (`GPS_CLAIM_USB`). When TurtleMesh uses a USB radio, TurtleTAK leaves that port alone.
+3. **Anchor to my ATAK**: your phone's position from the TAK Server or the mesh (`MY_ATAK`), if it's newer than 30 minutes.
+4. A **saved site** (`SITE`). Set one in Setup or by clicking the web map.
+5. A **manual** lat/lon.
+6. **Public IP** location, city level only. The marker gets a 25 km CE so TAK shows it's rough.
+
+Pick a **primary source** in Setup > Location to put it first; the rest stay as fallback in the same order.
 
 ## Setup
 
@@ -98,7 +101,7 @@ Every setting is in `/root/turtletak/default.cfg` as `KEY: value`. Change them i
 |---|---|---|
 | `CALLSIGN` | `TURTLE-1` | Name on the map |
 | `SA_INTERVAL` | `60` | Seconds between reports |
-| `LOC_MODE` | `auto` | `auto`, `gps`, `atak`, `site`, `manual` or `ip` |
+| `LOC_MODE` | `auto` | Primary location source: `auto`, `radio`, `gps`, `atak`, `site`, `manual` or `ip` |
 | `WATCH_INTERVAL` | `300` | Seconds between device sweeps |
 | `WATCH_IFACE` | `auto` | RJ45 interface; auto-detected, shown in Setup check |
 | `DHCP_KNOWN` | | Allowed DHCP servers (blank = learn the first) |

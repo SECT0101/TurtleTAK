@@ -1,6 +1,17 @@
 # Changelog
 
-TurtleTAK versions. Newest first.
+TurtleTAK versions (the payload in `payloads/library/general/TurtleTAK-Hub`). Newest first.
+
+## Hub Edition 1.0.1
+- **Location: primary source with fallback.** Setup > Location picks the primary source; the rest stay as fallback in order. New first source: the **Meshtastic radio's GPS**, shared by TurtleMesh while it runs on the same Hub.
+- **USB GPS leaves TurtleMesh's radio alone.** With TurtleMesh on a USB radio, the GPS reader no longer opens the radio's serial port.
+- **TurtleMesh console link** in the header while TurtleMesh runs, and the Alerts tab shows whether TurtleMesh sends these alerts over LoRa, and to which channel.
+- **Clear error instead of a silent stop**: a `payload.sh` cut off while copying, or a Python module missing on the Hub, now shows a Hub notification, a red LED and a log line.
+- **Windows line endings are fixed automatically**: a `payload.sh` pasted or saved on Windows now runs normally.
+- **Smaller payload**: the bundled map library is stored compressed (351 KB to 260 KB).
+- Settings, state and device names can no longer clash when two parts of the service save at the same moment.
+- The certificates folder note no longer says openssl is needed (it isn't).
+- Long server names wrap inside the Status cards.
 
 ## Hub Edition 1.0.0
 - First release for the LAN Turtle Hub, as one `payload.sh`: Bash for the Hub commands, with a Python 3 service and a web page written from it.
