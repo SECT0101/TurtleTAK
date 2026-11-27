@@ -2,6 +2,15 @@
 
 TurtleTAK versions (the payload in `payloads/library/general/TurtleTAK-Hub`). Newest first.
 
+## Hub Edition 1.0.2
+- **Marker type and team color in Setup**: sensor (`a-f-G-E-S`, the default), facility (`a-f-G-I`), team member (`a-f-G-U-C`) in any of ATAK's 14 team colors, or a custom CoT type, the same choices as TurtleTAK Classic. The new marker goes out as soon as you save.
+- **Chat in the web console**: click a sender's name or **Reply** to answer them directly, an unread count on the Chat tab, and delete one message or clear the chat.
+- **Who you can message**: every friendly TAK contact, mesh node and anyone who has messaged the Hub (CloudTAK users too), not only team members.
+- **Send alerts to** on the Alerts tab picks All Chat Rooms or one person (`ALERT_TO`).
+- Critical alerts in chat now read `[TURTLE-1] CRITICAL <title> - <detail>`, the same wording as the other SECT0101 TAK payloads (was `ALERT`).
+- **Set clock now** in Setup reads the time from the TAK Server, the web or NTP (`CLOCK_SYNC`), and the clock shows on the Status tab.
+- README: every setting is listed, plus notes on two Hub firmware bugs, Cloud C² Hub permissions and the eMudhra root certificates.
+
 ## Hub Edition 1.0.1
 - **Location: primary source with fallback.** Setup > Location picks the primary source; the rest stay as fallback in order. New first source: the **Meshtastic radio's GPS**, shared by TurtleMesh while it runs on the same Hub.
 - **USB GPS leaves TurtleMesh's radio alone.** With TurtleMesh on a USB radio, the GPS reader no longer opens the radio's serial port.

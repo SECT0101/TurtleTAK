@@ -2,15 +2,16 @@
 # Title: TurtleTAK Hub Edition
 # Description: Puts the LAN Turtle Hub on TAK as a facility sensor - position and status, GeoChat, network watch alerts (new devices, ARP spoofing, rogue DHCP, link tamper), an ATAK mesh SA bridge and a web console
 # Author: SECT0101
-# Version: 1.0.1
+# Version: 1.0.2
 # Category: General
 # Target: LAN Turtle Hub on a network you own or are authorized to monitor
 #
 # What it does
 #   Sensor on TAK     The Hub reports its position and status (uplink, RJ45 link, VPN, public IP,
-#                     watch and bridge counts) as a CoT marker (a-f-G-E-S) every SA_INTERVAL seconds
-#   GeoChat           Send / receive from the web console. Others can direct-message the Hub:
-#                     status, where, scan, alerts, help
+#                     watch and bridge counts) as a CoT marker every SA_INTERVAL seconds: sensor
+#                     (a-f-G-E-S, default), facility, team member in a team color, or custom (COT_TYPE)
+#   GeoChat           Send / receive from the web console (reply, unread count, delete / clear).
+#                     Others can direct-message the Hub: status, where, scan, alerts, help
 #   Network watch     Sweeps the RJ45 network, keeps a baseline per network and alerts on:
 #                     new devices, a gateway MAC change or duplicate gateway MAC (ARP spoofing),
 #                     a rogue DHCP server, RJ45 link lost / restored (tamper), TAK link down
@@ -126,7 +127,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from xml.sax.saxutils import escape as _xesc
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # ---- DNS: the Hub's C library (musl) can fail a lookup that asks for IPv4 and IPv6 at once
 # ("[Errno -5] Name has no usable address") while an IPv4-only lookup works - that is why ping works.
@@ -208,7 +209,7 @@ DEFAULTS = [
     ("UID", ""),                     # blank = made once from the device
     ("TEAM", "Cyan"),
     ("ROLE", "Team Member"),
-    ("COT_TYPE", "a-f-G-E-S"),       # friendly ground equipment sensor
+    ("COT_TYPE", "a-f-G-E-S"),       # a-f-G-E-S sensor | a-f-G-I facility | a-f-G-U-C team member (team color) | custom
     ("SA_INTERVAL", "60"),           # seconds between position/status reports
     ("# Location", None),
     ("LOC_MODE", "auto"),            # primary source: auto | radio | gps | atak | site | manual | ip (then the rest, in that order)
@@ -274,6 +275,7 @@ DEFAULTS = [
     ("RUN_AT_BOOT", "1"),
     ("CHAT_COMMANDS", "1"),          # answer "status", "where", "scan", "help" sent to this callsign
     ("CHAT_COMMANDS_FROM", ""),      # blank = anyone on the server, or a comma list of callsigns
+    ("CLOCK_SYNC", "1"),             # "Set clock now" reads the time from the TAK Server / web, then NTP
     ("WEB", "1"),
     ("WEB_PORT", "8484"),
     ("WEB_BIND", "0.0.0.0"),         # every interface: USB-C host, RJ45, Wi-Fi, VPN
@@ -445,6 +447,8 @@ S = {
     "hosts": {},          # mac -> {ip, first, last, known, vendor}
     "bridge": {"up_rx": 0, "up_tx": 0, "down_tx": 0, "devices": {}, "ifaces": [], "error": ""},
     "status": {},
+    "unread": 0,          # chat messages in since the Chat tab was last open
+    "clock": "",
 }
 SL = threading.RLock()
 
@@ -452,7 +456,7 @@ SL = threading.RLock()
 def save_state():
     try:
         with SL:
-            keep = {"pos": S["pos"], "alerts": S["alerts"][-200:], "chat": S["chat"][-300:],
+            keep = {"pos": S["pos"], "alerts": S["alerts"][-200:], "chat": S["chat"][-300:], "unread": S["unread"],
                     "dhcp_known": S["net"].get("dhcp_known", [])}
         tmp = "%s.%d.%d.tmp" % (STATEF, os.getpid(), threading.get_ident())
         with open(tmp, "w") as fh:
@@ -471,6 +475,7 @@ def load_state():
                 S["pos"]["src"] = "last known"
             S["alerts"] = d.get("alerts", [])
             S["chat"] = d.get("chat", [])
+            S["unread"] = int(d.get("unread", 0))
             S["net"]["dhcp_known"] = d.get("dhcp_known", [])
     except Exception:
         pass
@@ -527,7 +532,7 @@ def sa_event():
             + point_xml(p["lat"], p["lon"], p["ce"], p.get("hae", 0))
             + "<detail>"
             + '<contact callsign="%s" endpoint="*:-1:stcp"/>' % x(cfg("CALLSIGN"))
-            + '<__group name="%s" role="%s"/>' % (x(cfg("TEAM")), x(cfg("ROLE")))
+            + '<__group name="%s" role="%s"/>' % (x(team_name(cfg("TEAM"))), x(cfg("ROLE")))
             + '<takv device="LAN Turtle Hub" platform="%s" os="%s" version="%s"/>' % (
                 PRODUCT, x(st.get("os", "Linux")), VERSION)
             + '<precisionlocation geopointsrc="%s" altsrc="???"/>' % ("GPS" if p["src"] in ("gps", "radio") else "USER")
@@ -1192,19 +1197,48 @@ def chat_in(ev, ctype):
         S["chat"].append({"time": time.time(), "dir": "in", "from": c.get("senderCallsign", "?"), "from_uid": sender_uid,
                           "room": "Direct" if to_me else c.get("chatroom", ""), "text": text, "id": mid})
         del S["chat"][:-300]
+        S["unread"] += 1
     log("chat from %s: %s" % (c.get("senderCallsign", "?"), text[:120]))
     if to_me and cfgb("CHAT_COMMANDS"):
         chat_command(text.strip(), c.get("senderCallsign", ""), sender_uid)
     save_state()
 
 
+def dm_targets():
+    """callsign -> uid for everyone the Hub can direct-message: friendly TAK contacts, chat clients (they send
+    an endpoint), mesh nodes, and anyone who has messaged the Hub (CloudTAK users, sensors) even when their
+    position is stale. Same as BunnyTAK and SquirrelTAK."""
+    out = {}
+    with SL:
+        for m in S["chat"]:
+            if m.get("dir") == "in" and m.get("from_uid") and m.get("from"):
+                out[m["from"]] = m["from_uid"]
+        for u, c in S["contacts"].items():
+            if c["type"].startswith("a-f-") or c.get("endpoint") or c.get("team") or c.get("source") == "mesh":
+                out[c["callsign"]] = u
+    out.pop(cfg("CALLSIGN"), None)
+    return out
+
+
+def chat_delete(mid=None, t=None):
+    """One chat line, by its TAK message id, or by its time when it has none (same as BunnyTAK)."""
+    with SL:
+        n = len(S["chat"])
+        if mid:
+            S["chat"] = [m for m in S["chat"] if m.get("id") != mid]
+        elif t is not None:
+            S["chat"] = [m for m in S["chat"] if abs(float(m.get("time", 0)) - float(t)) > 0.001]
+        gone = n - len(S["chat"])
+    if not gone:
+        raise RuntimeError("message not found")
+    save_state()
+    return "message deleted"
+
+
 def chat_send(text, to_cs=None):
     to_uid = None
     if to_cs:
-        with SL:
-            for u, c in S["contacts"].items():
-                if c["callsign"] == to_cs:
-                    to_uid = u
+        to_uid = dm_targets().get(to_cs)
         if not to_uid:
             raise RuntimeError("no TAK contact called %s" % to_cs)
     xml, mid, room = chat_event(text, to_cs, to_uid)
@@ -1288,7 +1322,7 @@ def raise_alert(kind, level, title, detail, marker=True, key=None):
     notify("error" if level == "critical" else ("warning" if level == "warning" else "info"), "%s: %s" % (title, detail))
     if level != "info" and not quiet:
         led(flash="SPECIAL" if level == "warning" else "FAIL2", secs=60)
-    line = "[%s] %s %s - %s" % (cfg("CALLSIGN"), {"critical": "ALERT", "warning": "WARNING"}.get(level, "INFO"),
+    line = "[%s] %s %s - %s" % (cfg("CALLSIGN"), {"critical": "CRITICAL", "warning": "WARNING"}.get(level, "INFO"),
                                 title, detail)
     p = S["pos"]
     if marker and cfgb("ALERT_MARKER") and p["lat"] is not None and rank >= LEVELS.get(cfg("MARKER_MIN_LEVEL"), 1):
@@ -2654,6 +2688,98 @@ def check_pw(pw, stored):
         return False
 
 
+# ----------------------------------------------------------------------------------------------
+# clock: "Set clock now" reads the time from the TAK Server or the web, for a Hub without NTP
+# ----------------------------------------------------------------------------------------------
+HTTP_DATE = re.compile(r"^Date:\s*(.+)$", re.M | re.I)
+
+
+def set_clock(t, why):
+    if DRY:
+        log("clock> %s (%s)" % (iso(t), why), "debug")
+        return
+    delta = t - time.time()
+    try:
+        rc = subprocess.run(["date", "-u", "-s", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10).returncode
+    except Exception:
+        rc = 1
+    if rc == 0 or abs(time.time() - t) < 120:
+        if abs(delta) >= 30:
+            with SL:                                   # move the times already recorded with the clock
+                S["started"] += delta
+                S["tak"]["since"] += delta
+                for c in S["contacts"].values():
+                    c["time"] += delta
+                for h in S["hosts"].values():
+                    for k in ("first", "last"):
+                        if h.get(k):
+                            h[k] += delta
+            IPGEO["t"] = 0
+        log("clock set to %s UTC from %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t)), why))
+    else:
+        log("could not set the clock (date -s failed)", "warning")
+
+
+def clock_sync():
+    """Date header from the TAK Server's API port (no certificate check - only the time is read), then the web,
+    then NTP."""
+    if not cfgb("CLOCK_SYNC"):
+        S["clock"] = "off (CLOCK_SYNC)"
+        return False
+    import calendar
+    tries = []
+    host = cfg("TAK_HOST")
+    if host and not host.endswith("example.com"):
+        tries.append(("https", host, cfgi("API_PORT", 8443)))
+    tries += [("http", "www.google.com", 80), ("http", "detectportal.firefox.com", 80)]
+    for scheme, h, port in tries:
+        try:
+            s = socket.create_connection((h, port), timeout=8)
+            if scheme == "https":
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname=h)
+            s.sendall(("HEAD / HTTP/1.0\r\nHost: %s\r\nUser-Agent: TurtleTAK\r\n\r\n" % h).encode())
+            head = s.recv(4096).decode("latin-1", "replace")
+            s.close()
+            m = HTTP_DATE.search(head)
+            if not m:
+                continue
+            t = calendar.timegm(time.strptime(m.group(1).strip(), "%a, %d %b %Y %H:%M:%S GMT"))
+            if abs(t - time.time()) > 30:
+                set_clock(t, "%s:%d" % (h, port))
+            S["clock"] = "synced %s from %s" % (time.strftime("%H:%M"), h)
+            return True
+        except Exception as e:
+            log("clock from %s:%d: %s" % (h, port, e), "debug")
+    if have("ntpd"):
+        try:
+            if subprocess.run(["ntpd", "-n", "-q", "-p", "pool.ntp.org"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=20).returncode == 0:
+                S["clock"] = "synced %s (NTP)" % time.strftime("%H:%M")
+                return True
+        except Exception:
+            pass
+    S["clock"] = "not synced"
+    return False
+
+
+COT_TYPE_RE = re.compile(r"^a-[fhunpsajkox]-[A-Z](-[A-Za-z0-9]+)*$")
+TEAM_COLORS = ["White", "Yellow", "Orange", "Magenta", "Red", "Maroon", "Purple", "Dark Blue", "Blue", "Cyan",
+               "Teal", "Green", "Dark Green", "Brown"]
+
+
+def team_name(v):
+    """ATAK's spelling of a team color, whatever the case or hyphens: "dark-blue" -> "Dark Blue"."""
+    v = (v or "").strip()
+    key = re.sub(r"[\s_-]+", "", v).lower()
+    for n in TEAM_COLORS:
+        if n.replace(" ", "").lower() == key:
+            return n
+    return v
+
+
 def state_json():
     DEVS = devices()
     with SL:
@@ -2671,7 +2797,8 @@ def state_json():
                "uptime": now - S["started"], "tak": dict(S["tak"], host=cfg("TAK_HOST"), port=cfg("TAK_PORT"),
                                                          proto=cfg("TAK_PROTO"), queued=queue_len()),
                "pos": p, "gps": S["gps"], "status": S["status"], "contacts": contacts[:500],
-               "chat": S["chat"][-150:], "alerts": S["alerts"][-100:][::-1], "net": {k: v for k, v in S["net"].items()},
+               "chat": S["chat"][-150:], "unread": S["unread"], "dm_targets": sorted(dm_targets(), key=lambda n: n.lower()),
+               "clock": S["clock"], "team_colors": TEAM_COLORS, "alerts": S["alerts"][-100:][::-1], "net": {k: v for k, v in S["net"].items()},
                "hosts": sorted(({"mac": m, **h, "name": DEVS.get(m, {}).get("name", ""), "watch": DEVS.get(m, {}).get("watch", False),
                                  "missing": bool(S["net"].get("missing", {}).get(m, {}).get("alerted"))}
                                 for m, h in S["hosts"].items()), key=lambda h: ipaddress.ip_address(h["ip"])),
@@ -2710,6 +2837,20 @@ def action(a, d):
             raise RuntimeError("empty message")
         ok = chat_send(text, d.get("to") or None)
         return "sent" if ok else "queued (TAK offline)"
+    if a == "chat_read":
+        with SL:
+            S["unread"] = 0
+        return "ok"
+    if a == "chat_delete":
+        return chat_delete(str(d.get("id") or "") or None, d.get("time"))
+    if a == "chat_clear":
+        with SL:
+            S["chat"] = []
+            S["unread"] = 0
+        save_state()
+        return "chat cleared"
+    if a == "clock_sync":
+        return S["clock"] if clock_sync() else "could not get the time (no internet?)"
     if a == "scan":
         WATCH.kick.set()
         return "sweep started"
@@ -2986,6 +3127,15 @@ class Web(BaseHTTPRequestHandler):
                 d = json.loads(self.body() or b"{}")
                 known = {k for k, v in DEFAULTS if v is not None} - {"WEB_PASS_HASH", "UID"}
                 ch = {k: v for k, v in d.items() if k in known and not (k in SECRET_KEYS and v == "")}
+                if "COT_TYPE" in ch:
+                    ch["COT_TYPE"] = (ch["COT_TYPE"] or "").strip() or "a-f-G-E-S"
+                    # only check a value that changed, so an older saved value never blocks other settings
+                    if ch["COT_TYPE"] != cfg("COT_TYPE") and not COT_TYPE_RE.match(ch["COT_TYPE"]):
+                        raise RuntimeError("marker type: a CoT type like a-f-G-E-S (a-, affiliation, -G or another dimension, then the rest)")
+                if "TEAM" in ch:
+                    ch["TEAM"] = team_name(ch["TEAM"])
+                    if ch["TEAM"] != team_name(cfg("TEAM")) and ch["TEAM"] not in TEAM_COLORS:
+                        raise RuntimeError("team color: one of " + ", ".join(TEAM_COLORS))
                 cfg_set(ch)
                 if set(ch) & {"TAK_HOST", "TAK_PORT", "TAK_PROTO", "TAK_VERIFY_HOST"}:
                     TAK.reconnect()
@@ -2994,6 +3144,8 @@ class Web(BaseHTTPRequestHandler):
                 if "LED" in ch:
                     LED_STATE["shown"] = None
                     led()
+                if set(ch) & {"COT_TYPE", "TEAM", "ROLE", "CALLSIGN"}:
+                    threading.Thread(target=lambda: TAK.send(sa_event()), daemon=True).start()
                 log("settings changed in the web console: %s" % ", ".join(sorted(ch)))
                 return self.send(200, json.dumps({"ok": True, "msg": "saved %d setting(s)" % len(ch)}).encode())
             if path == "/api/upload":
@@ -4592,6 +4744,7 @@ details{margin:6px 0}
 .chatlog{height:52vh;overflow-y:auto;background:#0c110e;border:1px solid var(--line);border-radius:8px;padding:8px}
 .msg{white-space:pre-wrap;margin:4px 0;padding:6px 10px;border-radius:8px;max-width:80%;background:#1f2b23}
 .msg.out{margin-left:auto;background:#244a2f}.msg .h{font-size:11px;color:var(--dim)}
+.msg .h a{color:var(--acc)}.msg .del{float:right;margin-left:8px;color:var(--dim);cursor:pointer;text-decoration:none}.msg .del:hover{color:var(--crit)}
 pre{white-space:pre-wrap;background:#0c110e;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:12px;max-height:60vh;overflow:auto}
 .cfg{display:grid;grid-template-columns:minmax(160px,220px) 1fr;gap:4px 10px;align-items:center}
 .cfg h4{grid-column:1/3;margin:14px 0 2px;color:var(--acc);font-size:13px}
@@ -4644,14 +4797,16 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px}
     <select id="chat-to"><option value="">All Chat Rooms</option></select>
     <input id="chat-text" style="flex:1;min-width:200px" placeholder="Message" maxlength="1000">
     <button class="b">Send</button>
+    <button type="button" class="b red" onclick="if(confirm('Clear the whole chat on the Hub?'))act('chat_clear')">Clear chat</button>
   </form>
-  <p class="dim">Others can direct-message the Hub: <b>status</b>, <b>where</b>, <b>scan</b>, <b>alerts</b>, <b>help</b>.</p>
+  <p class="dim">Click a name or <b>Reply</b> to answer that person directly, and &times; to delete a message. Anyone who has messaged the Hub stays in the list. Others can direct-message the Hub: <b>status</b>, <b>where</b>, <b>scan</b>, <b>alerts</b>, <b>help</b>.</p>
 </section>
 <section id="t-alerts">
   <div class="card" style="margin-bottom:12px"><h3>Alert settings</h3>
     <div class="row" id="al-kinds"></div>
     <div class="frm"><label>Map marker from</label><select id="al-marker"><option value="info">info</option><option value="warning">warning</option><option value="critical">critical</option></select>
       <label>Chat line from</label><select id="al-chat"><option value="info">info</option><option value="warning">warning</option><option value="critical">critical</option></select>
+      <label>Send alerts to</label><select id="al-to"><option value="">All Chat Rooms</option></select>
       <label>Over LoRa (mesh)</label><span id="al-lora"></span>
       <label>Quiet hours</label><div class="row" style="margin:0"><input id="al-quiet" placeholder="e.g. 22-06 (blank = off)" size="16"><label><input type="checkbox" id="al-qcrit"> critical alerts still go out</label></div></div>
     <p class="dim">In quiet hours alerts are still logged, marked on the map and shown in the Hub's notifications, but there are no chat lines or LED flashes.</p>
@@ -4713,7 +4868,7 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px}
         <div class="row"><button class="b" onclick="enroll()">Enroll and connect</button></div>
       </div>
       <div class="kv" id="k-certs" style="margin-top:10px"></div>
-      <div class="row"><button class="b" onclick="diag()">Test connection</button><button class="b" onclick="act('reconnect')">Reconnect</button><button class="b" onclick="if(confirm('Put back the certificates that were loaded before the last import or enrollment?'))act('restore_certs')">Restore previous certificates</button></div>
+      <div class="row"><button class="b" onclick="diag()">Test connection</button><button class="b" onclick="act('reconnect')">Reconnect</button><button class="b" onclick="act('clock_sync')">Set clock now</button><button class="b" onclick="if(confirm('Put back the certificates that were loaded before the last import or enrollment?'))act('restore_certs')">Restore previous certificates</button></div>
       <pre id="diag" style="display:none"></pre>
     </div>
     <div class="card wide"><h3>2. Location</h3>
@@ -4736,6 +4891,13 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:20px}
       <div class="row"><label><input type="checkbox" id="ledon" onchange="setCfg({LED:this.checked?'1':'0'})"> Use the LED (off = stealth)</label></div>
       <div class="row"><input type="password" id="newpw" placeholder="New web password (8+)" autocomplete="new-password"><button class="b" onclick="setPw()">Change password</button></div>
       <h3 style="margin-top:12px">Setup check</h3><div class="kv" id="k-check"></div></div>
+    <div class="card"><h3>6. On the TAK map</h3>
+      <div class="frm" style="grid-template-columns:minmax(0,1fr);gap:4px"><label>Marker type</label><select id="mk-type" onchange="mkShow()"><option value="a-f-G-E-S">Sensor (a-f-G-E-S)</option><option value="a-f-G-I">Facility (a-f-G-I), a building or site</option><option value="a-f-G-U-C">Team member (a-f-G-U-C), a dot in a team color</option><option value="custom">Custom CoT type</option></select>
+        <label id="mk-cl">Custom CoT type</label><input id="mk-custom" placeholder="a-f-G-E-S-..." autocomplete="off">
+        <label>Team color</label><select id="mk-team"></select></div>
+      <div class="row"><button class="b" onclick="saveMarker()">Save marker</button></div>
+      <p class="dim">How TAK shows the Hub. Alert markers keep their own red / yellow / green. The team color shows on team member markers.</p>
+    </div>
   </div>
   <div class="card" style="margin-top:12px"><h3>Log</h3><div class="row"><button class="b" onclick="loadLog()">Refresh</button></div><pre id="log"></pre></div>
 </section>
@@ -4758,13 +4920,17 @@ async function api(path,opt={}){opt.headers=Object.assign({"X-TT":"1"},opt.heade
 function showLogin(){$("app").style.display="none";$("login").style.display="block"}
 async function login(e){e.preventDefault();try{await api("/api/login",{method:"POST",body:JSON.stringify({password:$("pw").value})});$("pw").value="";$("login").style.display="none";$("app").style.display="block";await refresh();go(tab)}catch(x){toast(x.message,1)}}
 async function logout(){try{await api("/api/logout",{method:"POST"})}catch(e){}showLogin()}
-async function act(a,extra={}){try{const d=await api("/api/action",{method:"POST",body:JSON.stringify(Object.assign({action:a},extra))});toast(d.msg||"done");refresh()}catch(e){toast(e.message,1)}}
+async function act(a,extra={}){try{const d=await api("/api/action",{method:"POST",body:JSON.stringify(Object.assign({action:a},extra))});if(a!="chat_read")toast(d.msg||"done");refresh()}catch(e){toast(e.message,1)}}
 async function setCfg(o){try{const d=await api("/api/cfg",{method:"POST",body:JSON.stringify(o)});toast(d.msg);cfgLoaded=false;refresh()}catch(e){toast(e.message,1)}}
-function nav(){$("nav").innerHTML=TABS.map(([k,l])=>`<button class="${k==tab?"on":""}" onclick="go('${k}')">${l}${k=="alerts"?'<span class="n" id="n-al" style="display:none"></span>':""}</button>`).join("");
+function nav(){$("nav").innerHTML=TABS.map(([k,l])=>`<button class="${k==tab?"on":""}" onclick="go('${k}')">${l}${k=="alerts"?'<span class="n" id="n-al" style="display:none"></span>':k=="chat"?'<span class="n" id="n-ch" style="display:none"></span>':""}</button>`).join("");
   document.querySelectorAll("section").forEach(s=>s.classList.toggle("on",s.id=="t-"+tab))}
-function syncChecks(){api("/api/cfg").then(c=>{const g=k=>(c.find(r=>r.key==k)||{}).value;const hst=g("TAK_HOST")||"";if(!/example\.com$/.test(hst)){$("cr-host").value=hst;$("en-host").value=hst}$("cr-port").value=g("TAK_PORT")||"";$("cr-proto").value=g("TAK_PROTO")||"tls";$("boot").checked=g("RUN_AT_BOOT")=="1";$("ledon").checked=g("LED")!="0";$("loc-mode").value=g("LOC_MODE")||"auto";$("loc-atak").value=g("MY_ATAK")||""}).catch(()=>{})}
+function syncChecks(){api("/api/cfg").then(c=>{const g=k=>(c.find(r=>r.key==k)||{}).value;const hst=g("TAK_HOST")||"";if(!/example\.com$/.test(hst)){$("cr-host").value=hst;$("en-host").value=hst}$("cr-port").value=g("TAK_PORT")||"";$("cr-proto").value=g("TAK_PROTO")||"tls";$("boot").checked=g("RUN_AT_BOOT")=="1";$("ledon").checked=g("LED")!="0";$("loc-mode").value=g("LOC_MODE")||"auto";$("loc-atak").value=g("MY_ATAK")||"";
+  const ct=g("COT_TYPE")||"a-f-G-E-S",std=["a-f-G-E-S","a-f-G-I","a-f-G-U-C"].includes(ct);$("mk-type").value=std?ct:"custom";$("mk-custom").value=std?"":ct;
+  const tc=$("mk-team");tc.innerHTML=((ST&&ST.team_colors)||[]).map(n=>`<option>${esc(n)}</option>`).join("");const tk=v=>(v||"").replace(/[\s_-]+/g,"").toLowerCase(),tn=((ST&&ST.team_colors)||[]).find(n=>tk(n)==tk(g("TEAM")));tc.value=tn||"Cyan";mkShow()}).catch(()=>{})}
+function mkShow(){const c=$("mk-type").value=="custom";$("mk-cl").style.display=$("mk-custom").style.display=c?"":"none"}
+function saveMarker(){const t=$("mk-type").value;setCfg({COT_TYPE:t=="custom"?$("mk-custom").value.trim():t,TEAM:$("mk-team").value})}
 function saveLoc(){setCfg({LOC_MODE:$("loc-mode").value,MY_ATAK:$("loc-atak").value.trim()})}
-function go(k){tab=k;if(k=="setup")syncChecks();if(k=="alerts"&&ST)loadAlertCfg();localStorageSet("tt_tab",k);nav();if(k=="map")setTimeout(initMap,50);if(k=="settings")loadCfg();if(k=="setup")loadLog();if(k=="alerts"&&ST&&ST.alerts.length){seenAlerts=ST.alerts[0].time;localStorageSet("tt_seen",seenAlerts)}render()}
+function go(k){tab=k;if(k=="setup")syncChecks();if(k=="chat")act("chat_read");if(k=="alerts"&&ST)loadAlertCfg();localStorageSet("tt_tab",k);nav();if(k=="map")setTimeout(initMap,50);if(k=="settings")loadCfg();if(k=="setup")loadLog();if(k=="alerts"&&ST&&ST.alerts.length){seenAlerts=ST.alerts[0].time;localStorageSet("tt_seen",seenAlerts)}render()}
 const ago=s=>{s=Math.max(0,Math.round(s));return s<90?s+"s":s<5400?Math.round(s/60)+"m":s<172800?Math.floor(s/3600)+"h"+String(Math.floor(s%3600/60)).padStart(2,"0"):Math.floor(s/86400)+"d"};
 const tm=t=>new Date(t*1000).toLocaleString();
 const kv=(id,rows)=>$(id).innerHTML=rows.filter(r=>r).map(([k,v])=>`<div>${esc(k)}</div><div>${v}</div>`).join("");
@@ -4775,17 +4941,17 @@ function render(){if(!ST)return;const s=ST,st=s.status||{},t=s.tak,p=s.pos;
   pill("p-rj",st.rj45_link?"ok":"bad",st.rj45_link?"RJ45 link":"RJ45 no link");
   pill("p-loc",p.lat==null?"bad":p.ce>1000?"mid":"ok","Loc: "+p.src);
   const na=s.alerts.filter(a=>a.time>seenAlerts&&a.level!="info").length,n=$("n-al");if(n){n.textContent=na;n.style.display=na?"inline":"none"}
+  const nc=$("n-ch");if(nc){nc.textContent=s.unread;nc.style.display=s.unread&&tab!="chat"?"inline":"none"}
   if(tab=="status"){kv("k-tak",[["Server",esc(t.host+":"+t.port+" ("+t.proto+")")],["State",`<span class="${t.state=="connected"?"ok":"warn"}">${esc(t.state)}</span> for ${ago(s.now-t.since)}`],t.error?["Error",`<span class="crit">${esc(t.error)}</span>`]:null,["Sent / received",t.tx+" / "+t.rx],s.cert&&s.cert.days!=null?["Certificate expires",`<span class="${s.cert.days<0?"crit":s.cert.days<=30?"warn":"ok"}">${new Date(s.cert.expires*1000).toLocaleDateString()} (${s.cert.days<0?"EXPIRED":s.cert.days+" days"})</span>`]:null,["Queued",t.queued],["Callsign",esc(s.callsign)],["UID",esc(s.uid)]]);
     kv("k-net",[["Uplink",esc(st.uplink+(st.gateway?" via "+st.gateway:""))],["RJ45",esc((st.rj45||"?")+" "+(st.rj45_link?"link ":"NO LINK ")+(st.rj45_ip||""))],["Wi-Fi client",esc(st.wifi_client||"off")],["VPN",esc(st.vpn||"none")],st.netbird?["NetBird",esc(st.netbird)]:null,["Public IP",esc((st.public_ip||"?")+" "+(st.isp||""))],["Target (USB-C) leases",st.target_leases]]);
     kv("k-loc",[["Source",esc(p.src)],["Position",p.lat==null?"unknown":p.lat.toFixed(6)+", "+p.lon.toFixed(6)],["Accuracy",p.ce>=9999999?"?":"+/- "+Math.round(p.ce)+" m"],["GPS",esc(s.gps.device?(s.gps.device+(s.gps.fix?" fix, "+s.gps.sats+" sats":" no fix")):"none")]]);
-    kv("k-hub",[["Uptime",ago(st.uptime||0)],["TurtleTAK up",ago(s.uptime)],["Load",esc(st.load)],["Memory free",Math.round((st.mem_free_kb||0)/1024)+" of "+Math.round((st.mem_total_kb||0)/1024)+" MB"],["OS",esc(st.os)],["Python",esc(st.python)]]);
+    kv("k-hub",[["Uptime",ago(st.uptime||0)],["TurtleTAK up",ago(s.uptime)],["Load",esc(st.load)],["Memory free",Math.round((st.mem_free_kb||0)/1024)+" of "+Math.round((st.mem_total_kb||0)/1024)+" MB"],["Clock",esc(new Date(s.now*1000).toLocaleString()+(s.clock?" ("+s.clock+")":""))],["OS",esc(st.os)],["Python",esc(st.python)]]);
     $("remarks").textContent=s.status_text}
   if(tab=="map"){const t2=s.tiles||{},sel=$("mp-src");if(!sel.options.length){sel.innerHTML=Object.entries(t2.sources||{}).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join("");sel.value=t2.source}
     const j=t2.job;$("mp-st").textContent=(j&&j.running?`Saving ${j.done}/${j.total} tiles... `:j?`Last save: ${j.saved} new, ${j.failed} failed${j.error?" - "+j.error:""}. `:"")+`Saved maps: ${t2.mb} of ${t2.limit_mb} MB`+(t2.root&&t2.root.indexOf("/usb")>=0?" (USB)":"");drawMap();$("tb-contacts").innerHTML="<tr><th>Callsign</th><th>Team</th><th>Range</th><th>Bearing</th><th>Seen</th><th>Via</th></tr>"+s.contacts.map(c=>`<tr><td>${esc(c.callsign)}</td><td>${esc(c.team)}</td><td>${c.dist==null?"":c.dist<1000?c.dist+" m":(c.dist/1000).toFixed(1)+" km"}</td><td>${c.brg==null?"":c.brg+"&deg;"}</td><td>${ago(c.age)} ago</td><td>${esc(c.source)}</td></tr>`).join("")}
-  if(tab=="chat"){const sig=s.chat.length+":"+(s.chat.length?s.chat[s.chat.length-1].id:"");if(sig!=chatSig){chatSig=sig;const l=$("chatlog");l.innerHTML=s.chat.map(m=>`<div class="msg ${m.dir}"><div class="h">${esc(m.from)} &rarr; ${esc(m.room)} &middot; ${tm(m.time)}${m.dir=="out"&&m.sent===false?" &middot; queued":""}</div>${esc(m.text)}</div>`).join("")||'<p class="dim">No messages yet.</p>';l.scrollTop=l.scrollHeight}
-    const sel=$("chat-to"),cur=sel.value,names=[...new Set(s.contacts.filter(c=>c.type.startsWith("a-f-G-U")||c.source=="mesh").map(c=>c.callsign))].sort();
-    if(sel._n!=names.join("|")){sel._n=names.join("|");sel.innerHTML='<option value="">All Chat Rooms</option>'+names.map(n=>`<option>${esc(n)}</option>`).join("");sel.value=cur}}
-  if(tab=="alerts"){$("al-qnow").textContent=s.quiet?"Quiet hours now":"";$("alertlist").innerHTML=s.alerts.map(a=>`<div class="alert lvl-${a.level}"><b>${esc(a.title)}</b> <span class="dim">${tm(a.time)} &middot; ${esc(a.kind)}</span><br>${esc(a.detail)}</div>`).join("")||'<p class="dim">No alerts.</p>'}
+  if(tab=="chat"){const sig=s.chat.length+":"+(s.chat.length?s.chat[0].time+":"+s.chat[s.chat.length-1].time:"");if(sig!=chatSig){chatSig=sig;const l=$("chatlog");l.innerHTML=s.chat.map(m=>`<div class="msg ${m.dir}"><div class="h"><a href="#" class="del" title="Delete this message" onclick="delMsg(this.dataset.id,this.dataset.t);return false" data-id="${esc(m.id||"")}" data-t="${m.time}">&times;</a>${m.dir=="in"?`<a href="#" title="Direct message ${esc(m.from)}" onclick="replyTo(this.dataset.cs);return false" data-cs="${esc(m.from)}">${esc(m.from)}</a>`:esc(m.from)} &rarr; ${esc(m.room)} &middot; ${tm(m.time)}${m.dir=="out"&&m.sent===false?" &middot; queued":""}${m.dir=="in"?` &middot; <a href="#" onclick="replyTo(this.dataset.cs);return false" data-cs="${esc(m.from)}">Reply</a>`:""}</div>${esc(m.text)}</div>`).join("")||'<p class="dim">No messages yet.</p>';l.scrollTop=l.scrollHeight;if(s.unread)act("chat_read")}
+    dmList($("chat-to"),'<option value="">All Chat Rooms</option>')}
+  if(tab=="alerts"){dmList($("al-to"),'<option value="">All Chat Rooms</option>');$("al-qnow").textContent=s.quiet?"Quiet hours now":"";$("alertlist").innerHTML=s.alerts.map(a=>`<div class="alert lvl-${a.level}"><b>${esc(a.title)}</b> <span class="dim">${tm(a.time)} &middot; ${esc(a.kind)}</span><br>${esc(a.detail)}</div>`).join("")||'<p class="dim">No alerts.</p>'}
   if(tab=="network"){const n=s.net;kv("k-watch",[["Interface",esc((n.iface||"?")+" "+(n.my_ip||""))],["Subnet",esc(n.subnet||"")],["Gateway",esc((n.gateway||"")+" "+(n.gateway_mac||""))],["State",esc(n.state||"waiting")],["Devices",(n.count||0)+" seen, "+(n.new||0)+" new"],["Baseline",n.baseline?(n.baseline_count+" known devices"):"none yet"],["Last sweep",n.last_sweep?ago(s.now-n.last_sweep)+" ago ("+esc(n.method)+", "+n.took+" s)":"pending"],["DHCP servers",esc(n.dhcp||"not checked yet")]]);
     const tb=$("tb-hosts"),sig=JSON.stringify(s.hosts.map(h=>[h.mac,h.ip,h.known,h.name,h.watch,h.missing,Math.round((s.now-h.last)/60)]));
     if(tb._sig!=sig&&!tb.contains(document.activeElement)){tb._sig=sig;tb.innerHTML="<tr><th>IP</th><th>Name</th><th>Watch</th><th>MAC</th><th>Vendor</th><th></th><th>Last seen</th></tr>"+s.hosts.map(h=>`<tr><td>${esc(h.ip)}</td><td><input value="${esc(h.name)}" placeholder="name" size="14" onchange="act('set_device',{mac:'${h.mac}',name:this.value})"></td><td><input type="checkbox" ${h.watch?"checked":""} onchange="act('set_device',{mac:'${h.mac}',watch:this.checked})"></td><td>${esc(h.mac)}</td><td>${esc(h.vendor)}</td><td>${h.missing?'<span class="tag" style="background:var(--crit);color:#fff">MISSING</span>':h.known?'<span class="tag">known</span>':'<span class="tag new">NEW</span>'}</td><td>${ago(s.now-h.last)} ago</td></tr>`).join("")}
@@ -4804,6 +4970,10 @@ function dot(c){return L.divIcon({className:"",html:`<div style="width:14px;heig
 function drawMap(){if(!map||!ST)return;layers.clearLayers();const p=ST.pos;
   if(p.lat!=null){L.marker([p.lat,p.lon],{icon:dot("#6fcf4a")}).bindTooltip(ST.callsign+" (Hub)",{permanent:true,direction:"right"}).addTo(layers);if(p.ce<5000)L.circle([p.lat,p.lon],{radius:p.ce,color:"#6fcf4a",weight:1,fillOpacity:.05}).addTo(layers)}
   ST.contacts.forEach(c=>{const col=c.type.startsWith("a-h")?"#ff5c5c":c.type.startsWith("a-u")?"#f2b631":c.type.startsWith("a-n")?"#7de07d":"#4fb3ff";L.marker([c.lat,c.lon],{icon:dot(col)}).bindTooltip(esc(c.callsign)).addTo(layers)})}
+function dmList(sel,head){const cur=sel.value||sel.dataset.want||"",names=(ST.dm_targets||[]).slice();if(cur&&!names.includes(cur))names.push(cur);const sig=names.join("|");
+  if(sel._n!=sig){sel._n=sig;sel.innerHTML=head+names.map(n=>`<option>${esc(n)}</option>`).join("");sel.value=cur}}
+function replyTo(cs){const sel=$("chat-to");if(![...sel.options].some(o=>o.value==cs)){const o=document.createElement("option");o.textContent=cs;sel.appendChild(o)}sel.value=cs;$("chat-text").focus()}
+function delMsg(id,t){if(confirm("Delete this message?"))act("chat_delete",id?{id}:{time:+t})}
 async function sendChat(e){e.preventDefault();const t=$("chat-text").value.trim();if(!t)return;await act("chat",{text:t,to:$("chat-to").value});$("chat-text").value=""}
 async function loadCfg(){if(cfgLoaded)return;try{const c=await api("/api/cfg");cfgLoaded=true;$("cfgform").innerHTML=c.map(r=>r.section?`<h4>${esc(r.key.replace(/^#\s*/,""))}</h4>`:`<label for="c-${r.key}">${esc(r.key)}</label><input id="c-${r.key}" data-k="${r.key}" ${r.key=="UID"?"readonly title=\"Set once from the device\"":""} ${r.secret?'type="password" placeholder="'+(r.set?"(set - blank keeps it)":"")+'"':""} value="${esc(r.value)}">`).join("")}catch(e){toast(e.message,1)}}
 async function saveCfg(){const o={};document.querySelectorAll("#cfgform input").forEach(i=>{if(i.type=="password"&&i.value==="")return;o[i.dataset.k]=i.value});await setCfg(o)}
@@ -4828,8 +4998,8 @@ async function cloneImport(){const f=$("cl-file").files[0];if(!f)return toast("C
   if(!confirm("Load "+f.name+" onto this Hub? Its TAK settings, certificates, sites and device names are replaced."))return;try{const d=await sendFile(f,{"X-Callsign":$("cl-cs").value.trim()});toast(d.msg);$("cl-file").value="";cfgLoaded=false;refresh()}catch(e){toast(e.message,1)}}
 async function loadAlertCfg(){try{const c=await api("/api/cfg"),g=k=>(c.find(r=>r.key==k)||{}).value||"";const on=g("ALERTS_ON").split(",");
   $("al-kinds").innerHTML=(ST.alert_kinds||[]).map(([k,l])=>`<label style="margin-right:12px"><input type="checkbox" class="al-k" value="${k}" ${on.includes(k)?"checked":""}> ${esc(l)}</label>`).join("");
-  $("al-marker").value=g("MARKER_MIN_LEVEL")||"warning";$("al-chat").value=g("CHAT_MIN_LEVEL")||"info";$("al-quiet").value=g("QUIET_HOURS");$("al-qcrit").checked=g("QUIET_CRITICAL")!="0"}catch(e){}}
-function saveAlertCfg(){setCfg({ALERTS_ON:[...document.querySelectorAll(".al-k:checked")].map(i=>i.value).join(","),MARKER_MIN_LEVEL:$("al-marker").value,CHAT_MIN_LEVEL:$("al-chat").value,QUIET_HOURS:$("al-quiet").value.trim(),QUIET_CRITICAL:$("al-qcrit").checked?"1":"0"})}
+  $("al-marker").value=g("MARKER_MIN_LEVEL")||"warning";$("al-chat").value=g("CHAT_MIN_LEVEL")||"info";const at=$("al-to");at.dataset.want=g("ALERT_TO");at._n=null;dmList(at,'<option value="">All Chat Rooms</option>');at.value=g("ALERT_TO");$("al-quiet").value=g("QUIET_HOURS");$("al-qcrit").checked=g("QUIET_CRITICAL")!="0"}catch(e){}}
+function saveAlertCfg(){setCfg({ALERTS_ON:[...document.querySelectorAll(".al-k:checked")].map(i=>i.value).join(","),MARKER_MIN_LEVEL:$("al-marker").value,CHAT_MIN_LEVEL:$("al-chat").value,ALERT_TO:$("al-to").value,QUIET_HOURS:$("al-quiet").value.trim(),QUIET_CRITICAL:$("al-qcrit").checked?"1":"0"})}
 async function loadLog(){try{$("log").textContent=await api("/api/log");$("log").scrollTop=1e9}catch(e){}}
 async function refresh(){try{ST=await api("/api/state");$("login").style.display="none";$("app").style.display="block";
   render()}catch(e){}}

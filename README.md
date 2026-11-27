@@ -8,7 +8,7 @@ Community payloads that connect the **Hak5 LAN Turtle** family to the **TAK** ec
 
 **Payloads here are written in Bash + Python for the LAN Turtle Hub. They are community payloads and are not supported or guaranteed by Hak5.** See [Legal](#legal).
 
-Also see [TurtleMesh](https://github.com/SECT0101/TurtleMesh) for Meshtastic on the same Hub, [PagerTAK](https://github.com/SECT0101/PagerTAK) for the WiFi Pineapple Pager and [SharkTAKDisplay](https://github.com/SECT0101/SharkTAKDisplay) for the Shark Jack Display.
+Also see [TurtleMesh](https://github.com/SECT0101/TurtleMesh) for Meshtastic on the same Hub, [TurtleShell](https://github.com/SECT0101/TurtleShell) to run both from one payload, [TurtleTAK Classic](https://github.com/SECT0101/TurtleTAK-Classic) for the original LAN Turtle and LAN Turtle SD, [PagerTAK](https://github.com/SECT0101/PagerTAK) for the WiFi Pineapple Pager and [SharkTAKDisplay](https://github.com/SECT0101/SharkTAKDisplay) for the Shark Jack Display.
 
 ---
 
@@ -22,7 +22,7 @@ ATAK (left) and WinTAK (right): the Hub as a sensor marker, its alert markers ar
 
 | Edition | Device | Version | Description |
 |---|---|---|---|
-| [TurtleTAK Hub Edition](payloads/library/general/TurtleTAK-Hub/) | LAN Turtle Hub | 1.0.1 | The Hub on TAK as a facility sensor: position and status reports and GeoChat; network watch alerts (new devices, watched devices going missing, ARP spoofing, rogue DHCP, link tamper, TAK link down and certificate expiry) with per-type settings and quiet hours; device names, site survey data packages and clone packages; an ATAK mesh SA bridge; TAK setup like ATAK (connection package, certificates with their own passwords, or enrollment) with no openssl needed; Wi-Fi and WireGuard uplinks; and a web console on port 8484 with an offline map. |
+| [TurtleTAK Hub Edition](payloads/library/general/TurtleTAK-Hub/) | LAN Turtle Hub | 1.0.2 | The Hub on TAK as a facility sensor: position and status reports and GeoChat; network watch alerts (new devices, watched devices going missing, ARP spoofing, rogue DHCP, link tamper, TAK link down and certificate expiry) with per-type settings and quiet hours; device names, site survey data packages and clone packages; an ATAK mesh SA bridge; TAK setup like ATAK (connection package, certificates with their own passwords, or enrollment) with no openssl needed; Wi-Fi and WireGuard uplinks; and a web console on port 8484 with an offline map. |
 
 ## Repository layout
 
